@@ -11,6 +11,7 @@ import android.content.Context
 object AutoConnectPrefs {
     private const val PREFS = "settings"
     private const val KEY = "auto_connect_on_bt"
+    private const val KEY_MEDIA_BLUETOOTH = "connect_media_bluetooth_after_wifi"
 
     /** 默认开：这是「拉开车门就自动连」的开关，用户主动关掉才停用。 */
     const val DEFAULT = true
@@ -28,6 +29,20 @@ object AutoConnectPrefs {
             .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY, enabled)
+            .apply()
+    }
+
+    fun mediaBluetoothEnabled(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_MEDIA_BLUETOOTH, false)
+
+    fun setMediaBluetoothEnabled(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_MEDIA_BLUETOOTH, enabled)
             .apply()
     }
 }

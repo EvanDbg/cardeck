@@ -1,5 +1,6 @@
 package io.github.shaonialife.cardeck.bt
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
@@ -114,6 +115,57 @@ object BtProfiles {
             awaitDisconnected(context, address, 500L)
         }
         return before
+    }
+
+    /** 在后台尝试连接单个车机的 A2DP，保留系统中的媒体音频开关状态。 */
+    @SuppressLint("MissingPermission")
+    fun connectMedia(
+        context: Context,
+        device: BluetoothDevice,
+        isCurrent: () -> Boolean,
+        log: (String) -> Unit,
+    ) {
+        runCatching {
+            val media = proxy(context, BluetoothProfile.A2DP)
+            if (!isCurrent()) return
+            if (media == null) {
+                log("BT-MEDIA: 无法获取 A2DP 服务")
+                return
+            }
+            when (media.getConnectionState(device)) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    log("BT-MEDIA: 车机媒体蓝牙已连接")
+                    return
+                }
+                BluetoothProfile.STATE_CONNECTING -> Unit
+                else -> {
+                    // Android 对外只公开查询接口，单项连接与现有的单项断开一样走系统方法。
+                    val connect = media.javaClass.getMethod("connect", BluetoothDevice::class.java)
+                    if (!isCurrent()) return
+                    log("BT-MEDIA: 已绑定车机 Wi-Fi，请求连接 A2DP")
+                    if (connect.invoke(media, device) != true) {
+                        log("BT-MEDIA: 系统未接受 A2DP 连接请求")
+                        return
+                    }
+                }
+            }
+            repeat(20) {
+                if (!isCurrent()) return
+                if (media.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED) {
+                    log("BT-MEDIA: 车机媒体蓝牙已连接")
+                    return
+                }
+                Thread.sleep(250)
+            }
+            log("BT-MEDIA: 5 秒内未确认 A2DP 已连接")
+        }.onFailure { error ->
+            if (error is InterruptedException) {
+                Thread.currentThread().interrupt()
+            } else {
+                val cause = (error as? java.lang.reflect.InvocationTargetException)?.targetException ?: error
+                log("BT-MEDIA: A2DP 连接失败（${cause.javaClass.simpleName}: ${cause.message.orEmpty()}）")
+            }
+        }
     }
 
     /** 断开后仍在线的配置文件（用于日志判断是否真的断开）。 */

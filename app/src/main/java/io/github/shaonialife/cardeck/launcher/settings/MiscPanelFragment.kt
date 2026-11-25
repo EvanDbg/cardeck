@@ -6,6 +6,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.SeekBar
 import android.widget.TextView
+import androidx.appcompat.widget.SwitchCompat
 import io.github.shaonialife.cardeck.R
 import io.github.shaonialife.cardeck.bt.AutoConnectPrefs
 
@@ -51,6 +52,12 @@ class MiscPanelFragment : SettingsPanelFragment() {
         }
         autoConnectOn.setOnClickListener { applyAutoConnect(true) }
         autoConnectOff.setOnClickListener { applyAutoConnect(false) }
+
+        val mediaBluetooth = view.findViewById<SwitchCompat>(R.id.switchMediaBluetoothAfterWifi)
+        mediaBluetooth.isChecked = AutoConnectPrefs.mediaBluetoothEnabled(ctx)
+        mediaBluetooth.setOnCheckedChangeListener { _, checked ->
+            AutoConnectPrefs.setMediaBluetoothEnabled(ctx, checked)
+        }
 
         // HID 原始日志（键位校准）：默认关；打开后每帧 hidSendReport 写一行 HID-RAW
         val hidRawOn = view.findViewById<TextView>(R.id.btnHidRawOn)

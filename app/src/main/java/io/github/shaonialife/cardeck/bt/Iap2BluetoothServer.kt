@@ -26,9 +26,9 @@ import java.util.concurrent.atomic.AtomicReference
 class Iap2BluetoothServer(
     private val context: Context,
     private val log: (String) -> Unit,
-    private val onEndpoint: (Iap2SenderSession.CarPlayEndpoint) -> Unit = {},
+    private val onEndpoint: (Iap2SenderSession.CarPlayEndpoint, BluetoothSocket) -> Unit = { _, _ -> },
     /** 0x5703 一到即触发（绑 WiFi + 广播 _carplay-ctrl），真车 0x4301 的前置条件。 */
-    private val onWifiCredentials: (Iap2SenderSession.WifiConfiguration) -> Unit = {},
+    private val onWifiCredentials: (Iap2SenderSession.WifiConfiguration, BluetoothSocket) -> Unit = { _, _ -> },
     /** 发送端链路断开（保活泵退出）时通知主控（释放僵尸轮次，见 SessionController.onSenderLinkClosed）。 */
     private val onLinkClosed: () -> Unit = {},
     /** 目标车机（动态读取：拒绝非目标设备的连入；null=来者不拒）。 */
@@ -146,8 +146,8 @@ class Iap2BluetoothServer(
             channel.runSenderSession(
                 context,
                 log,
-                onEndpoint,
-                onWifiCredentials,
+                { endpoint -> onEndpoint(endpoint, socket) },
+                { wifi -> onWifiCredentials(wifi, socket) },
                 onLinkClosed,
             )
         } catch (error: IOException) {

@@ -55,6 +55,11 @@ class WifiCarPlayConnector(
     val currentNetwork: Network? get() = boundNetwork.get()
     private val boundNetwork = AtomicReference<Network?>(null)
 
+    fun isProcessBoundTo(network: Network): Boolean = currentNetwork == network && connectivityManager.boundNetworkForProcess == network
+
+    @Volatile
+    var onNetworkBound: ((ssid: String, network: Network, ssidVerified: Boolean) -> Unit)? = null
+
     /**
      * 绑定网络是否仍有效。系统把进程切回其它网络（家庭 WiFi 抢回默认网）/
      * 热点网络被回收时，[Network] 对象可能还在引用里但已失效——capabilities
@@ -241,6 +246,7 @@ class WifiCarPlayConnector(
                     result.set(network)
                     log("WiFi: 已加入应用专属网络 \"$ssid\"（$network bindProcessToNetwork=$bound）——不影响其它应用联网")
                     latch.countDown()
+                    if (bound) onNetworkBound?.invoke(ssid, network, true)
                 }
 
                 override fun onUnavailable() {
@@ -387,6 +393,7 @@ class WifiCarPlayConnector(
                     val bound = connectivityManager.bindProcessToNetwork(network)
                     log("WiFi: 已绑定当前WiFi网络 $network bindProcessToNetwork=$bound")
                     if (reported.compareAndSet(false, true)) onResult(true)
+                    if (bound && ssidHint != null) onNetworkBound?.invoke(ssidHint, network, false)
                 }
 
                 override fun onUnavailable() {

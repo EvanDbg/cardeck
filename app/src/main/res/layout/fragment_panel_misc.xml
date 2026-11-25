@@ -2,6 +2,7 @@
 <!-- 「杂项设置」面板：不属于任何主题域的开关。外层 ScrollView 与其它面板一致
      （车机侧内容区只有约 200dp 高，必须能滚动）。 -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:fillViewport="true"
@@ -66,6 +67,25 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
             android:text="车机蓝牙连上时自动拉起会话（需 Shizuku 已启动）。需要「显示在其他应用上层」权限才能在后台启动；该权限缺失时会自动补授。"
+            android:textColor="#FF8E8E93"
+            android:textSize="12sp" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/switchMediaBluetoothAfterWifi"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:minHeight="48dp"
+            android:text="@string/media_bluetooth_after_wifi"
+            android:textColor="#FFF5F5F7"
+            android:textSize="14sp"
+            android:thumb="@drawable/sw_thumb"
+            app:track="@drawable/sw_track" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/media_bluetooth_after_wifi_description"
             android:textColor="#FF8E8E93"
             android:textSize="12sp" />
 

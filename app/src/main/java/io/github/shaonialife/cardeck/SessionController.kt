@@ -1,6 +1,7 @@
 package io.github.shaonialife.cardeck
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothSocket
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -15,6 +16,7 @@ import io.github.shaonialife.cardeck.airplay.AirPlayLink
 import io.github.shaonialife.cardeck.audio.AudioProfile
 import io.github.shaonialife.cardeck.audio.AudioSender
 import io.github.shaonialife.cardeck.audio.AudioTuning
+import io.github.shaonialife.cardeck.bt.AutoConnectPrefs
 import io.github.shaonialife.cardeck.bt.BtProfiles
 import io.github.shaonialife.cardeck.bt.BtSessionGate
 import io.github.shaonialife.cardeck.bt.Iap2BluetoothClient
@@ -51,6 +53,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 进程级会话中枢：**日志缓冲**与**会话管线所有权**的唯一持有者。
@@ -236,6 +239,15 @@ object SessionController {
     // ---- 会话对象（进程级所有权；Activity 重建不影响）----
 
     private var wifiConnector: WifiCarPlayConnector? = null
+
+    private class CarWifiPeer(
+        val ssid: String,
+        val socket: BluetoothSocket,
+    ) {
+        val mediaConnectionRequested = AtomicBoolean(false)
+    }
+
+    private val carWifiPeer = AtomicReference<CarWifiPeer?>(null)
 
     /**
      * 当前已绑定到哪个车机热点（bindCarWifiAndRegister 成功后写入）。
@@ -608,6 +620,7 @@ object SessionController {
             if (bluetoothServer != null) return
             wifiConnector =
                 WifiCarPlayConnector(context) { line -> appendLog(line) }.also { connector ->
+                    connector.onNetworkBound = ::maybeConnectMediaBluetooth
                     // 应用专属网络被系统断开（车机熄火/离开范围）：明确告知用户，
                     // 而不是让英雄卡在「已连接」与失败之间静默摇摆
                     connector.onNetworkLost = { ssid ->
@@ -617,8 +630,6 @@ object SessionController {
                         appendLog(">>> 车机热点 \"$ssid\" 已断开——本次会话需重新连接")
                     }
                 }
-            val wifiCredentialHook: (Iap2SenderSession.WifiConfiguration) -> Unit =
-                { wifi -> onWifiCredentials(wifi) }
             // 目标车机动态读取：选择后下一轮连接尝试/下一次连入即生效，无需重启链路
             val targetProvider: () -> TargetDevicePrefs.Target? = {
                 appContext?.let { TargetDevicePrefs.get(it) }
@@ -627,8 +638,8 @@ object SessionController {
                 Iap2BluetoothServer(
                     context,
                     log = { line -> appendLog(line) },
-                    onEndpoint = { endpoint -> onCarPlayEndpoint(endpoint, "车机回连") },
-                    onWifiCredentials = wifiCredentialHook,
+                    onEndpoint = { endpoint, socket -> onCarPlayEndpoint(endpoint, "车机回连", socket) },
+                    onWifiCredentials = ::onWifiCredentials,
                     onLinkClosed = ::onSenderLinkClosed,
                     targetProvider = targetProvider,
                 )
@@ -636,8 +647,8 @@ object SessionController {
                 Iap2BluetoothClient(
                     context,
                     log = { line -> appendLog(line) },
-                    onEndpoint = { endpoint -> onCarPlayEndpoint(endpoint, "主动连车机") },
-                    onWifiCredentials = wifiCredentialHook,
+                    onEndpoint = { endpoint, socket -> onCarPlayEndpoint(endpoint, "主动连车机", socket) },
+                    onWifiCredentials = ::onWifiCredentials,
                     onLinkClosed = ::onSenderLinkClosed,
                     targetProvider = targetProvider,
                 )
@@ -765,6 +776,7 @@ object SessionController {
         context: Context,
         userInitiated: Boolean = false,
     ) {
+        carWifiPeer.set(null)
         val hadProjection = CarPlayService.mediaProjection != null
         ConnectingBanner.dismiss()
         if (userInitiated) {
@@ -1155,7 +1167,10 @@ object SessionController {
      * 主动发 `GET /ctrl-int/1/connect` 邀请，邀请被接受才发 0x4301。
      * 因此这里必须：绑车机 WiFi → 广播 ctrl；晚于 0x4300 则双方互等死锁（Audi 实测）。
      */
-    fun onWifiCredentials(wifi: Iap2SenderSession.WifiConfiguration) {
+    private fun onWifiCredentials(
+        wifi: Iap2SenderSession.WifiConfiguration,
+        socket: BluetoothSocket,
+    ) {
         // 会话推流中收到的 0x5703 是冗余凭据（DiPlay 控制器周期重连会重发一轮
         // Phase 1，2026-10-15 实测「连上后自动断开」循环的推手之一）：此时再走绑定
         // 流程会 release+重绑进程网络（扰动正在推流的 socket）、force 重注册 ctrl
@@ -1166,6 +1181,7 @@ object SessionController {
             appendLog("0x5703 冗余凭据（会话推流中）——保持现有 WiFi 绑定与 ctrl 广播不变")
             return
         }
+        trackCarWifiPeer(wifi.ssid, socket)
         ssidSink?.invoke(wifi.ssid)
         lastWifiPsk = wifi.passphrase
         lastCarWifiSsid = wifi.ssid
@@ -1181,6 +1197,42 @@ object SessionController {
         // 手机连着公司 WiFi 时会误判已在车机热点（ctrl 广播落在错误网络 → 双方互等死锁），
         // 必须先核对真实 SSID 再决定绑定或切换
         autoJoinCarWifi(wifi)
+    }
+
+    private fun trackCarWifiPeer(
+        ssid: String,
+        socket: BluetoothSocket,
+    ) {
+        if (ssid.isBlank()) return
+        carWifiPeer.updateAndGet { current ->
+            current?.takeIf { it.socket === socket && it.ssid == ssid } ?: CarWifiPeer(ssid, socket)
+        }
+        // iAP2 重连时可能复用已经绑定的热点，不会再收到网络回调。
+        if (boundCarSsid == ssid) wifiConnector?.currentNetwork?.let { maybeConnectMediaBluetooth(ssid, it) }
+    }
+
+    private fun maybeConnectMediaBluetooth(
+        ssid: String,
+        network: Network,
+        ssidVerified: Boolean = false,
+    ) {
+        val context = appContext ?: return
+        if (connectCancelled || !AutoConnectPrefs.mediaBluetoothEnabled(context)) return
+        val peer = carWifiPeer.get()?.takeIf { it.ssid == ssid && !it.mediaConnectionRequested.get() } ?: return
+        Bg.run("car-media-bluetooth") {
+            fun isCurrent(): Boolean =
+                !connectCancelled &&
+                    carWifiPeer.get() === peer &&
+                    peer.socket.isConnected &&
+                    wifiConnector?.isProcessBoundTo(network) == true &&
+                    AutoConnectPrefs.mediaBluetoothEnabled(context)
+
+            // bindCurrentWifi 只按 Wi-Fi transport 绑定，必须重新确认 SSID。
+            if (!isCurrent() || (!ssidVerified && shellWifiStatus().second != ssid)) return@run
+            if (!isCurrent() || !peer.mediaConnectionRequested.compareAndSet(false, true)) return@run
+            val device = peer.socket.remoteDevice ?: return@run
+            BtProfiles.connectMedia(context, device, ::isCurrent, ::appendLog)
+        }
     }
 
     /**
@@ -2365,6 +2417,7 @@ object SessionController {
     private fun onCarPlayEndpoint(
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         source: String,
+        socket: BluetoothSocket? = null,
     ) {
         val context = appContext ?: return
         // 冗余端点防护：接收端控制器（DiPlay 实测）在我们配对推流后才完成既有的
@@ -2399,6 +2452,7 @@ object SessionController {
                 return
             }
         }
+        if (socket != null) trackCarWifiPeer(effective.ssid, socket)
         appendLog(
             ">>> [$source] 拿到接收端热点：SSID=${effective.ssid}；" +
                 "密码=${if (effective.passphrase.isEmpty()) "(空)" else "已获取"}",

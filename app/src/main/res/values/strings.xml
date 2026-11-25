@@ -6,5 +6,7 @@
     <string name="app_name">CarDeck 车机投屏</string>
     <string name="app_subtitle">非官方实验性 CarPlay 兼容发送端</string>
     <string name="car_settings">车机设置</string>
+    <string name="media_bluetooth_after_wifi">入网后连接媒体蓝牙</string>
+    <string name="media_bluetooth_after_wifi_description">连上车机 Wi‑Fi 后尝试连接该车机的媒体蓝牙。用蓝牙播放时，请关闭首页的「车机侧声音」。</string>
     <string name="accessibility_description">镜像模式：把车机触摸手势注入手机屏幕，不读取屏幕内容</string>
 </resources>
