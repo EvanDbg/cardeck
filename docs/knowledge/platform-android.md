@@ -167,3 +167,13 @@
   时先卸官方再装新的，服务不掉线无缝接管。同理 ShizukuGate.installed 的权限定义发现
   在此形态下返回 null（定义方已卸载），引导会落到「未安装」——但 binder-first 的
   state() 不受影响（先探 binder）。
+
+- **独立 iAP2 诊断包须显式开启，不能修改默认 debug 包名**（2026-11-26）：旧 APK
+  签名私钥不可用时，新证书不能覆盖同包名安装。保留日常 `standardDebug` 的原包名，
+  仅在构建该变体时传 `-Pcardeck.parallelDebug=true`，得到 `.iap2debug` 独立包与
+  「CarDeck iAP2调试」标签；该开关只用于 `standardDebug`，不与 remote flavor 混用。
+  默认 debug 身份关系到既有数据、Shizuku 授权和 `run-as` 路径，不能为一次诊断全局改名。
+  独立包需单独授权 Shizuku/通知访问等；测试时只运行一个 CarDeck 实例，切换前先断开
+  释放虚拟屏并停止另一实例。Manifest authority 用 `${applicationId}`，显式组件用
+  运行时包名与绝对类名；不把 `src/remote` 的桥带入标准诊断包。安装、重建和手动日志
+  导出见 `docs/DEBUG-IAP2.md`。
