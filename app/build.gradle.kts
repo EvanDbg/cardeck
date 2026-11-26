@@ -27,7 +27,7 @@ plugins {
 //    已装用户可直接覆盖升级。
 //  - CI（`.github/workflows/android-ci.yml`）传 `-Pcardeck.buildNumber=<run_number>`
 //    时，构建号**顶替第 4 位**（0.1.28.57），无需往仓库写提交。
-val appVersionName = "0.1.32.0"
+val appVersionName = "0.1.32.1"
 val versionParts =
     appVersionName.split(".").map { part ->
         part.toIntOrNull() ?: error("appVersionName 必须是数字点分（收到 \"$part\"）")
@@ -102,6 +102,11 @@ check(buildNumber == null || hasReleaseKeystore) {
     "传了 -Pcardeck.buildNumber 但没有 keystore.properties —— 预发布构建禁止使用 debug 签名"
 }
 
+// 仅用于 standardDebug 的独立 iAP2 诊断包；必须显式传 true，默认日常包身份不变。
+// 不与 remote flavor 混用，构建/安装约定见 docs/DEBUG-IAP2.md。
+val parallelDebug =
+    providers.gradleProperty("cardeck.parallelDebug").map { it.toBooleanStrict() }.getOrElse(false)
+
 android {
     namespace = "io.github.shaonialife.cardeck"
     compileSdk = 34
@@ -112,6 +117,7 @@ android {
         targetSdk = 34
         versionCode = effectiveVersionCode
         versionName = effectiveVersionName
+        manifestPlaceholders["appLabel"] = "@string/app_name"
         // 对外展示版本（第 4 位为 0 时不带第 4 位）：不含 flavor/debug 后缀，
         // 给首页底部等面向用户的位置；诊断场景用完整 VERSION_NAME
         buildConfigField("String", "DISPLAY_VERSION", "\"$displayVersionName\"")
@@ -151,10 +157,15 @@ android {
             signingConfig = signingConfigs.getByName(if (hasReleaseKeystore) "release" else "debug")
         }
         debug {
-            // **不要加 applicationIdSuffix**：本项目 debug 包就是日常使用的包——
-            // Shizuku 授权是按包名授予的，改包名会要求重新授权；AGENTS.md 里的
-            // `run-as io.github.shaonialife.cardeck` 调试链路也会一起失效。
-            versionNameSuffix = "-debug"
+            // 默认 debug 仍是日常包：保留包名、Shizuku 授权与既有 run-as 调试路径。
+            // 找不到旧签名时，显式 opt-in 的独立诊断包可保留旧安装和数据。
+            if (parallelDebug) {
+                applicationIdSuffix = ".iap2debug"
+                versionNameSuffix = "-iap2debug"
+                manifestPlaceholders["appLabel"] = "CarDeck iAP2调试"
+            } else {
+                versionNameSuffix = "-debug"
+            }
         }
     }
 
