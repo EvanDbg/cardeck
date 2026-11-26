@@ -1,11 +1,12 @@
 package io.github.shaonialife.cardeck.transport
 
-import io.github.shaonialife.cardeck.protocol.NativeBridge
 import java.io.Closeable
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 链路通道：一个读线程 + 一个节奏线程驱动【原生会话】（cardeck-protocol
@@ -19,11 +20,18 @@ import java.util.concurrent.TimeUnit
  * （旧 consumers = Iap2SenderSession 的纯日志解析，零行为消费）——
  * EventSink 只保留 "LINK msg" 诊断日志 + 编排事件分流。
  */
-class Iap2LinkChannel(
+class Iap2LinkChannel internal constructor(
     private val stream: DuplexStream,
-    name: String = "iap2-link",
-    private val log: (String) -> Unit = {},
+    private val name: String,
+    private val log: (String) -> Unit,
+    private val native: Iap2NativeSession,
 ) : Closeable {
+    constructor(
+        stream: DuplexStream,
+        name: String = "iap2-link",
+        log: (String) -> Unit = {},
+    ) : this(stream, name, log, NativeIap2Session)
+
     val isAlive: Boolean get() = !terminated
 
     /** 编排事件：WIFI=-1、ENDPOINT=-2、PHASE1_DONE=-3（Rust session_flow 发）。 */
@@ -45,38 +53,73 @@ class Iap2LinkChannel(
         wirelessAllowed: Int,
         carplayPaired: Int,
     ) {
-        check(handle != 0L) { "flow start on dead channel" }
-        NativeBridge.nativeSessionFlowStart(
-            handle,
-            deviceName,
-            bluetoothMac,
-            language,
-            tzOffsetMinutes,
-            dst,
-            wirelessAllowed,
-            carplayPaired,
-        )
+        val started =
+            withNativeHandle { current ->
+                native.startFlow(
+                    current,
+                    deviceName,
+                    bluetoothMac,
+                    language,
+                    tzOffsetMinutes,
+                    dst,
+                    wirelessAllowed,
+                    carplayPaired,
+                )
+                true
+            }
+        if (started != true) throw IOException("flow start on closed channel")
     }
 
     /** 取下一个编排事件；超时返回 null。 */
-    fun pollFlowEvent(timeoutMillis: Long): FlowEvent? =
-        try {
-            flowEvents.poll(timeoutMillis, TimeUnit.MILLISECONDS)
-        } catch (_: InterruptedException) {
-            null
-        }
+    fun pollFlowEvent(timeoutMillis: Long): FlowEvent? {
+        if (terminated) return null
+        val event =
+            try {
+                flowEvents.poll(timeoutMillis, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                null
+            }
+        return event?.takeUnless { terminated || it === CLOSED_FLOW_EVENT }
+    }
 
-    private val lock = Object()
+    /**
+     * 所有 JNI 调用与销毁串行；原生调用可同步回调 send，所以回调不得再次进入此锁/JNI。
+     * writeLock 只串行化写入。close 不拿任一锁，必须先关闭传输以解除阻塞读写。
+     */
+    private val nativeCallLock = Any()
+    private val writeLock = Any()
+    private val closeStarted = AtomicBoolean(false)
+    private val channelId = CHANNEL_IDS.incrementAndGet()
+    private val terminated: Boolean get() = closeStarted.get()
+    private var firstWrite = true
+
+    @Volatile
+    private var readerThread: Thread? = null
+
+    @Volatile
+    private var pacerThread: Thread? = null
+
+    private fun diagnostic(message: String) {
+        // 日志失败不能阻止关闭；只新增阶段/计数，不输出报文或身份字段。
+        runCatching { log("LINK lifecycle #$channelId: $message") }
+    }
+
+    private fun <T> withNativeHandle(block: (Long) -> T): T? {
+        if (terminated) return null
+        return synchronized(nativeCallLock) {
+            if (terminated || handle == 0L) null else block(handle)
+        }
+    }
+
     private val flowEvents = LinkedBlockingQueue<FlowEvent>()
     private val readyLatch = CountDownLatch(1)
 
     @Volatile
-    private var terminated = false
     private var readySignalled = false
     private var lastEventPollMs = 0L
 
     /** 原生会话句柄（0 = 未创建）。 */
-    @Volatile
     private var handle: Long = 0L
 
     /** 原始字节转储预算（每方向每连接），真车字节级对照用。 */
@@ -84,85 +127,79 @@ class Iap2LinkChannel(
     private var txDumpBudget = RAW_DUMP_LIMIT_TX
 
     init {
-        if (!NativeBridge.ensureLoaded()) {
-            throw IOException("cardeck_protocol 未加载——原生链路不可用")
-        }
-        handle = NativeBridge.nativeSessionCreate(0x2000L)
-        if (handle == 0L) {
-            throw IOException("原生会话创建失败")
-        }
-        // 出帧：Rust 协议层 → RFCOMM 写
-        NativeBridge.nativeSetTransport(
-            handle,
-            object : NativeBridge.TransportSender {
-                override fun send(bytes: ByteArray) {
-                    dumpOutbound(bytes)
-                    try {
-                        synchronized(lock) {
-                            if (!terminated) stream.write(bytes)
+        try {
+            if (!native.ensureLoaded()) {
+                throw IOException("cardeck_protocol 未加载——原生链路不可用")
+            }
+            synchronized(nativeCallLock) {
+                diagnostic("create enter")
+                handle = native.create(0x2000L)
+                diagnostic("create returned created=${handle != 0L}")
+                if (handle == 0L) throw IOException("原生会话创建失败")
+                native.setTransport(handle, ::sendBytes)
+                if (!terminated) {
+                    // 编排事件直通；协议帧镜像仍只记 id+len，不入业务队列。
+                    native.setEventSink(handle) { msgId, bytes ->
+                        if (!terminated) {
+                            log("LINK msg: id=0x${"%04x".format(msgId)} len=${bytes.size}")
+                            if (msgId < 0) flowEvents.offer(FlowEvent(msgId, bytes))
                         }
-                    } catch (error: IOException) {
-                        finish(error.message ?: error.javaClass.simpleName)
                     }
                 }
-            },
-        )
-        // 事件汇：Rust 编排事件（WIFI/ENDPOINT/PHASE1_DONE = 负 id）直通
-        // flowEvents；协议帧镜像只打诊断日志（id+len——连接排查的眼睛），
-        // 不再入队过宿主（A7：解析面已退役，Rust 内部消化）
-        NativeBridge.nativeSessionSetEventSink(
-            handle,
-            object : NativeBridge.EventSink {
-                override fun onEvent(
-                    msgId: Int,
-                    bytes: ByteArray,
-                ) {
-                    if (terminated) return
-                    log("LINK msg: id=0x${"%04x".format(msgId)} len=${bytes.size}")
-                    if (msgId < 0) flowEvents.offer(FlowEvent(msgId, bytes))
-                }
-            },
-        )
-        Thread({ runReader() }, "$name-reader").apply {
-            isDaemon = true
-            start()
+            }
+            val reader = Thread({ runReader() }, "$name-reader").apply { isDaemon = true }
+            val pacer = Thread({ runPacer() }, "$name-pacer").apply { isDaemon = true }
+            readerThread = reader
+            pacerThread = pacer
+            if (!terminated) {
+                reader.start()
+                pacer.start()
+            }
+        } catch (error: Throwable) {
+            finish("create/register failed: ${error.message ?: error.javaClass.simpleName}")
+            throw error
         }
-        Thread({ runPacer() }, "$name-pacer").apply {
-            isDaemon = true
-            start()
+    }
+
+    /** 同步 JNI 回调：只写传输；失败后返回原生调用，销毁由独立线程完成。 */
+    private fun sendBytes(bytes: ByteArray) {
+        if (terminated) return
+        try {
+            synchronized(writeLock) {
+                if (terminated) return
+                dumpOutbound(bytes)
+                val report = firstWrite
+                firstWrite = false
+                if (report) diagnostic("write enter bytes=${bytes.size}")
+                stream.write(bytes)
+                if (report) diagnostic("write returned bytes=${bytes.size}; peer reception unconfirmed")
+            }
+        } catch (error: IOException) {
+            finish("write failed: ${error.message ?: error.javaClass.simpleName}")
         }
     }
 
     /** 等待链路协商完成（原生 FSM s5 Connected）。 */
     fun awaitReady(timeoutMillis: Long): Boolean {
-        // timeoutMillis == 0 → 无限期（fw-engine：无 Kotlin 超时；哨兵值不做
-        // 纳秒算术——Long.MAX_VALUE * 1e6 会溢出成负 deadline 立即假失败）
-        val deadline =
-            if (timeoutMillis == 0L) {
-                Long.MAX_VALUE
-            } else {
-                System.nanoTime() + timeoutMillis * 1_000_000L
-            }
-        while (true) {
-            if (terminated) return false
-            if (readySignalled || NativeBridge.nativeSessionLinkReady(handle) == 1) {
-                readySignalled = true
-                readyLatch.countDown()
-                return true
-            }
-            if (System.nanoTime() >= deadline) {
-                return NativeBridge.nativeSessionLinkReady(handle) == 1
-            }
+        if (terminated) return false
+        val completed =
             try {
-                Thread.sleep(10)
+                if (timeoutMillis == 0L) {
+                    readyLatch.await()
+                    true
+                } else {
+                    readyLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)
+                }
             } catch (_: InterruptedException) {
-                return false
+                Thread.currentThread().interrupt()
+                false
             }
-        }
+        // Ready 探测只由节拍线程执行；关闭必须能唤醒等待者，不能让它也卡在 JNI。
+        return completed && readySignalled && !terminated
     }
 
     /** 对端协商的最大控制载荷（已扣除帧头与校验和）。 */
-    fun peerMaxControlPayload(): Int? = if (handle == 0L) null else NativeBridge.nativeSessionPeerMaxControl(handle).takeIf { it > 0 }
+    fun peerMaxControlPayload(): Int? = withNativeHandle(native::peerMaxControl)?.takeIf { it > 0 }
 
     override fun close() {
         finish(null)
@@ -173,11 +210,21 @@ class Iap2LinkChannel(
     private fun runReader() {
         try {
             // 传输已连（构造即意味着 RFCOMM 就绪）——固件 attach 流：
-            // LinkStart → Attached → FSM ev2（SYN 出站由原生链完成）
-            NativeBridge.nativeSessionBtAttached(handle)
+            // LinkStart → Attached → FSM ev2；探测/协商报文由原生链决定。
+            withNativeHandle { current ->
+                diagnostic("attach enter")
+                native.attach(current)
+                diagnostic("attach returned")
+            } ?: return
             val buffer = ByteArray(4096)
-            while (true) {
+            var firstRead = true
+            while (!terminated) {
+                if (firstRead) diagnostic("read enter")
                 val count = stream.read(buffer)
+                if (firstRead) {
+                    diagnostic("read returned bytes=$count")
+                    firstRead = false
+                }
                 if (count < 0) {
                     finish(null)
                     return
@@ -185,10 +232,10 @@ class Iap2LinkChannel(
                 if (count == 0) continue
                 if (terminated) return
                 dumpInbound(buffer.copyOf(count))
-                NativeBridge.nativeSessionFeed(handle, buffer.copyOf(count))
+                withNativeHandle { native.feed(it, buffer.copyOf(count)) } ?: return
             }
         } catch (error: Throwable) {
-            finish(error.message ?: error.javaClass.simpleName)
+            finish("reader failed: ${error.message ?: error.javaClass.simpleName}")
         }
     }
 
@@ -204,28 +251,31 @@ class Iap2LinkChannel(
     }
 
     private fun runPacer() {
-        while (!terminated) {
-            if (handle == 0L) break
-            val sleep = NativeBridge.nativeSessionTick(handle).coerceIn(1, 20).toLong()
-            val now = System.currentTimeMillis()
-            if (now - lastEventPollMs >= 1000) {
-                lastEventPollMs = now
-                for (kind in 0..5) {
-                    val ev = NativeBridge.nativeSessionTakeEvents(handle, kind)
-                    if (!ev.isNullOrEmpty() && !ev.contains("\"events\":[]")) {
-                        log("IAP2-EVT k=$kind " + ev.take(300))
+        try {
+            while (!terminated) {
+                val sleep = withNativeHandle(native::tick)?.coerceIn(1, 20)?.toLong() ?: return
+                val now = System.currentTimeMillis()
+                if (now - lastEventPollMs >= 1000) {
+                    lastEventPollMs = now
+                    for (kind in 0..5) {
+                        val ev = withNativeHandle { native.takeEvents(it, kind) }
+                        if (!ev.isNullOrEmpty() && !ev.contains("\"events\":[]")) {
+                            log("IAP2-EVT k=$kind " + ev.take(300))
+                        }
                     }
                 }
+                if (!readySignalled && withNativeHandle(native::linkReady) == 1 && !terminated) {
+                    readySignalled = true
+                    readyLatch.countDown()
+                }
+                try {
+                    Thread.sleep(sleep)
+                } catch (_: InterruptedException) {
+                    return
+                }
             }
-            if (!readySignalled && NativeBridge.nativeSessionLinkReady(handle) == 1) {
-                readySignalled = true
-                readyLatch.countDown()
-            }
-            try {
-                Thread.sleep(sleep)
-            } catch (_: InterruptedException) {
-                return
-            }
+        } catch (error: Throwable) {
+            finish("pacer failed: ${error.message ?: error.javaClass.simpleName}")
         }
     }
 
@@ -237,27 +287,41 @@ class Iap2LinkChannel(
     }
 
     private fun finish(reason: String?) {
-        synchronized(lock) { finishLocked(reason?.let { IOException(it) }) }
-    }
-
-    private fun finishLocked(failure: IOException?) {
-        if (terminated) return
-        terminated = true
+        if (!closeStarted.compareAndSet(false, true)) return
+        // 先记录第一失败点；不能等一个可能卡住的 nativeDestroy 返回后才记日志。
+        diagnostic("close requested${reason?.let { ": $it" } ?: ""}")
         readyLatch.countDown()
-        lock.notifyAll()
-        if (handle != 0L) {
-            NativeBridge.nativeSessionDestroy(handle)
-            handle = 0L
-        }
+        flowEvents.clear()
+        flowEvents.offer(CLOSED_FLOW_EVENT)
+        // 不等 writeLock/nativeCallLock：关闭底层 socket 才能解除阻塞读/写和同步 JNI 回调。
+        diagnostic("transport close enter")
         runCatching { stream.close() }
-        if (failure != null) {
-            log("LINK closed: ${failure.message}")
-        } else {
-            log("LINK closed")
+            .onSuccess { diagnostic("transport close returned") }
+            .onFailure { diagnostic("transport close failed: ${it.message ?: it.javaClass.simpleName}") }
+        val current = Thread.currentThread()
+        readerThread?.takeUnless { it === current }?.interrupt()
+        pacerThread?.takeUnless { it === current }?.interrupt()
+        Thread({
+            synchronized(nativeCallLock) {
+                val oldHandle = handle
+                handle = 0L
+                if (oldHandle != 0L) {
+                    diagnostic("destroy enter")
+                    runCatching { native.destroy(oldHandle) }
+                        .onSuccess { diagnostic("destroy returned") }
+                        .onFailure { diagnostic("destroy failed: ${it.message ?: it.javaClass.simpleName}") }
+                }
+            }
+            runCatching { log("LINK closed${reason?.let { ": $it" } ?: ""}") }
+        }, "$name-close").apply {
+            isDaemon = true
+            start()
         }
     }
 
     private companion object {
+        val CHANNEL_IDS = AtomicLong(0)
+        val CLOSED_FLOW_EVENT = FlowEvent(Int.MIN_VALUE, byteArrayOf())
         const val PACER_POLL_MILLIS = 20L
 
         /** 原始字节转储预算：rx 需覆盖车机全部协商帧（Audi 实测约 140B），给 512B 余量。 */
